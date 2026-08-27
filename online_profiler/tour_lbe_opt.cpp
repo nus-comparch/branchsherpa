@@ -35,69 +35,69 @@
  * 
  */
 
-
 #include "dr_api.h"
 #include "drmgr.h"
 #include <cstdint>
 #include <unordered_map>
 #include <algorithm>
 
+// Number of address bits used for indexing the "Outcome Frequency Table (OFT)"
 #define ADDRESS_LENGTH 48
+// Number of history bits used for indexing the OFT
 #define HISTORY_LENGTH 20
 
-// Declare Lock for Preventing Contention in Local "Outcome Frequency Table (OFT)"
+// Mutex protecting accesses to the global OFT
 static void *map_lock;
 
-// Declare counters (i.e., "taken", "not taken", and "transitions") for each conditional branch
+// Counts taken and not-taken outcomes for a branch under a given history
 typedef struct _counter_per_branch_t {
     uint64_t n_taken;
     uint64_t n_not_taken;
 } counter_per_branch_t;
 
-// Declare variables to compute taken rate and transition rate
+// Stores the taken probability and linear branch entropy for a branch-history pair
 typedef struct _entropy_info_t {
     double taken_probability;
     double linear_entropy;
 } entropy_info_t;
 
 
-/* ******* Data structures and variables related to global history ******* */
+/* ******* Data structures and variables for the global history ******* */
 
-// Declare variables and a mask to record a global pattern
+// Global branch history and mask used to retain the most recent branch outcomes
 #define GLOBAL_PATTERN uint32_t
 #define GLOBAL_HISTORY_MASK (( 1u << HISTORY_LENGTH ) - 1 )
 GLOBAL_PATTERN global_pattern = 0;
 
-// Declare an "Outcome Frequency Table (OFT)" using unodered map (hash table) in C++
+// OFT indexed by branch address and global history
 #define GLOBAL_OFT_DATA_STRUCTURE std::unordered_map<app_pc, std::unordered_map<GLOBAL_PATTERN, counter_per_branch_t>> 
 GLOBAL_OFT_DATA_STRUCTURE global_oft;
 
-// Making Data Structure for "Tournament Predictor" 
+// Stores the branch entropy of each branch based on global history
 #define TOUR_PREDICTOR_GLOBAL std::unordered_map<app_pc, double>
 
 
+/* ******* Data structures and variables for local history ******* */
 
-
-/* ******* Data structures and variables related to local history ******* */
-
-// Declare for Recording Local Pattern
+// Local branch history and mask used to retain the most recent branch outcomes
 #define LOCAL_PATTERN uint32_t
 #define LOCAL_HISTORY_MASK ( ( 1u << HISTORY_LENGTH ) - 1 )
 
-// Storing "history pattern" for each branch instruction
+// Stores the local history pattern for each branch instruction
 #define PER_BRANCH_PATTERN std::unordered_map<app_pc, LOCAL_PATTERN> 
 PER_BRANCH_PATTERN pattern_per_branch;
 
-// Declare "Outcome Frequency Table (OFT)" using Unodered Map (Hash Table) in C++
+// OFT indexed by branch address and local history
 #define LOCAL_OFT_DATA_STRUCTURE std::unordered_map<app_pc, std::unordered_map<LOCAL_PATTERN, counter_per_branch_t>> 
 LOCAL_OFT_DATA_STRUCTURE local_oft;
 
-// Making Data Structure for "Tournament Predictor"
+// Stores the branch entropy of each branch based on local history
 #define TOUR_PREDICTOR_LOCAL std::unordered_map<app_pc, double>
 
 
-/* ******* Data structures and variables related to tournament history ******* */
+/* ******* Data structures and variables for tournament branch entropy ******* */
 
+// Stores the selected entropy for each branch address
 #define TOUR_ENTROPY_OFT std::unordered_map<app_pc, double>
 TOUR_ENTROPY_OFT tour_entropy_oft;
 
@@ -108,7 +108,10 @@ TOUR_ENTROPY_LIST tour_entropy_list;
 TOUR_ENTROPY_LIST_ALIASING tour_entropy_list_aliasing;
 
 
-// Declare Variables for Tournament Entropy from Global History and Local History
+/*
+ * Accumulators for global- and local-history entropy
+ * for the current address and history lengths 
+ */
 double      tour_entropy_per_addr_global_aliasing       = 0;
 double      tour_entropy_per_addr_local_aliasing        = 0;
 uint64_t    total_instructions_per_addr_global_aliasing = 0;
@@ -121,14 +124,16 @@ cbr_count(void *drcontext, app_pc src, app_pc targ, int taken)
 {
     dr_mutex_lock(map_lock);
 
-    /* ********* Updating taken and not-taken counter using global history ********* */
+    /* Record the branch outcome for both global and local history */
     
-    // Temporarily store global branch pattern
+    // Record the history preceding the current branch
     GLOBAL_PATTERN global_history = global_pattern;
 
-    // Update the number of taken in "global OFT" and global branch pattern
+    /*
+     *  Record the branch outcome under the current global history,
+     *  then update the history with the observed outcome
+     */
     auto &taken_update_global = global_oft[src];
-
     if (taken)
     {
         taken_update_global[global_history].n_taken++;
@@ -141,14 +146,14 @@ cbr_count(void *drcontext, app_pc src, app_pc targ, int taken)
     }
 
 
-    /* ********* Updating taken and not-taken counter using local history ********* */
-    
-    // Temporarily store local branch pattern
+    // Record the history preceding the current branch
     LOCAL_PATTERN local_history = pattern_per_branch[src];
 
-    // Update the number of taken and not-taken in local OFT and local branch pattern
+    /*
+     *  Record the branch outcome under the current local history,
+     *  then update the history with the observed outcome
+     */
     auto &taken_update_local = local_oft[src];
-
     if (taken)
     {
         taken_update_local[local_history].n_taken++;        
@@ -166,6 +171,11 @@ cbr_count(void *drcontext, app_pc src, app_pc targ, int taken)
 static void
 record_tour_entropy(TOUR_PREDICTOR_GLOBAL &global_entry, TOUR_PREDICTOR_LOCAL &local_entry, TOUR_ENTROPY_OFT &tour_entry)
 {
+    /*
+     * Select the lower entropy between the global- and local-history
+     * for each branch address
+     */
+
     for (auto &g : global_entry) 
     {
         app_pc global_tour_addr = g.first;
@@ -183,26 +193,16 @@ record_tour_entropy(TOUR_PREDICTOR_GLOBAL &global_entry, TOUR_PREDICTOR_LOCAL &l
     }
 }
 
-static void
-average_tour_entropy(TOUR_ENTROPY_OFT &entries, int bit_length)
-{
-    average_tour_entropy_per_bit = 0;
-
-    // Calculating Tour Entropy Depending on Histroy Size and Recording that Value to the HashMap
-    for (auto &t : entries)
-    {
-        average_tour_entropy_per_bit += t.second;
-    }
-    tour_entropy_list[bit_length] = average_tour_entropy_per_bit / entries.size();
-    // dr_printf("************* entropy: %.6lf, # of entries: %u *************\n\n", tour_entropy_list[bit_length], entries.size());
-}
 
 static void
 average_tour_entropy_aliasing(TOUR_ENTROPY_OFT &entries, int address_length, int bit_length)
 {
     average_tour_entropy_per_bit = 0;
 
-    // Calculating Tour Entropy Depending on Histroy Size and Recording that Value to the HashMap
+    /*
+     * Average the tournament entropy across all branch addresses
+     * and store the result for the current address and history lengths
+     */
     for (auto &t : entries)
     {
         average_tour_entropy_per_bit += t.second;
@@ -217,7 +217,7 @@ static dr_emit_flags_t
 event_app_instruction(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
                       bool for_trace, bool translating, void *user_data)
 {
-    // Instrument on conditional branch instructions
+    // Instrument conditional branch instructions
     if(!instr_is_cbr(instr))
         return DR_EMIT_DEFAULT;    
     dr_insert_cbr_instrumentation(drcontext, bb, instr, (void*)cbr_count);
@@ -228,12 +228,14 @@ event_app_instruction(void *drcontext, void *tag, instrlist_t *bb, instr_t *inst
 void
 dr_exit(void)
 {
-    // Calculating branch entropy by applying optimizations in Linear Branch Entropy paper
+    /*
+     * Compute branch entropy by applying the address- and history-merging
+     * Optimizations described in the Linear Branch Entropy paper
+     */
 
     /*
-     * Outer loop: merging address bits (first optimization)
-     * Inner loop: mering history bits (second optimization)
-     * Please refere "Linear Branch Entropy" paper for more information
+     * Outer loop progressively merges address bits
+     * Inner loop progressively merges history bits
     */
 
     // ==== outer loop ====
@@ -251,12 +253,12 @@ dr_exit(void)
 
             for(auto &aliasing_entry : global_oft)
             {
-                // Updating Address Length and Recording It to Newly Created OFT
+                // Merge address bits and map branches to the new aliased address
                 app_pc pc = aliasing_entry.first;
                 uintptr_t new_address = ((uintptr_t) pc) & address_merging_mask;
                 auto &aliasing_map = global_aliasing_pc_temp[app_pc(new_address)];
             
-                // Updating Branch Outcome to Newly Created OFT
+                // Merge branch outcome counts for branches mapped to the same aliased address
                 auto &old_counter  = aliasing_entry.second;
 
                 for (auto &temp : old_counter)
@@ -283,12 +285,12 @@ dr_exit(void)
 
             for(auto &aliasing_entry : local_oft)
             {
-                // Updating Address Length and Recording It to Newly Created OFT
+                // Merges address bits and map branches to the new aliased address
                 app_pc pc = aliasing_entry.first;
                 uintptr_t new_address = ((uintptr_t) pc) & address_merging_mask;
                 auto &aliasing_map = local_aliasing_pc_temp[app_pc(new_address)];
             
-                // Updating Branch Outcome to Newly Created OFT
+                // Merge branch outcome counts for branches mapped to the same aliased address
                 auto &old_counter  = aliasing_entry.second;
 
                 for (auto &temp : old_counter)
@@ -306,14 +308,14 @@ dr_exit(void)
         }
 
         /*
-         * After applying address merging, copy the oft to the new data structure for history bit merging
-         * For memory efficiency, declare a variable inside block
+         * Preserve the address-merged OFT as the starting point for history-bit merging
+         * The temporary data structures are scoped within this block to reduce memory usage
          */
         {
             // ********** Global History Part **********
             GLOBAL_OFT_DATA_STRUCTURE global_history_aliasing_oft;
 
-            // Copying the data structure after applying address merging
+            // Copy the address-merged OFT as the starting point for history-bit merging
             global_history_aliasing_oft.reserve(global_oft.size());
             for (auto &ent1 : global_oft)
             {
@@ -323,7 +325,7 @@ dr_exit(void)
             // ********** Local History Part **********
             LOCAL_OFT_DATA_STRUCTURE local_history_aliasing_oft;
 
-            // Copying the data structure after applying address merging
+            // Copy the address-merged OFT as the starting point for history-bit merging
             local_history_aliasing_oft.reserve(local_oft.size());
             for (auto &ent2 : local_oft)
             {
@@ -334,7 +336,7 @@ dr_exit(void)
             // ==== Inner loop ====
             for (int n_bit = HISTORY_LENGTH; n_bit >= 0; --n_bit)
             {
-                // Merging Two History Bits for Smaller Number of History Bits
+                // Retain the lower n_bit history bits to evaluate the corresponding history length
                 uint32_t bit_merging_mask = (1u << n_bit) - 1;
 
                 std::unordered_map<app_pc, double> tour_temporary_oft_aliasing;
@@ -349,8 +351,6 @@ dr_exit(void)
 
                     for(auto &temp_oft : global_history_aliasing_oft)
                     {
-                        // GLOBAL_OFT_DATA_STRUCTURE new_oft;
-
                         app_pc pc           = temp_oft.first;
                         auto &old_counter   = temp_oft.second;
                         auto &merged_map    = global_aliasing_hist_temp[pc];
@@ -368,6 +368,7 @@ dr_exit(void)
                         }
                     }
 
+                    // Replace the current OFT with the history-merged OFT
                     global_history_aliasing_oft.swap(global_aliasing_hist_temp);
                 }
 
@@ -387,16 +388,16 @@ dr_exit(void)
                         GLOBAL_PATTERN hist = a.first;
                         auto &ctr = a.second;
 
-                        //update entropy info 
+                        // Compute the taken probability and corresponding linear branch entropy
                         double taken_probability    = double(ctr.n_taken) / double(ctr.n_taken + ctr.n_not_taken);
                         double linear_entropy       = 2 * std::min(taken_probability, (1 - taken_probability));
 
-                        // Calculating Final "Branch Entropy"
+                        // Accumulate execution-weighted entropy for this branch address
                         tour_entropy_per_addr_global_aliasing        += double(ctr.n_taken + ctr.n_not_taken) * linear_entropy;
                         total_instructions_per_addr_global_aliasing  += (ctr.n_taken + ctr.n_not_taken);
                     }
 
-                    // Recording Global Tour Entropy in Temporary HashMap
+                    // Store the global-history entropy for this branch address
                     tour_entropy_per_addr_global_aliasing = (tour_entropy_per_addr_global_aliasing / total_instructions_per_addr_global_aliasing);
                     tour_temporary_global_aliasing[addr] = tour_entropy_per_addr_global_aliasing;
                 }
@@ -423,6 +424,7 @@ dr_exit(void)
                             temp_hist.n_not_taken   += old_count.n_not_taken;
                         }
                     }
+                    // Replace the current OFT with the history-merged OFT
                     local_history_aliasing_oft.swap(local_aliasing_hist_temp);
                 }
 
@@ -443,27 +445,28 @@ dr_exit(void)
                         LOCAL_PATTERN hist = a.first;
                         auto &ctr = a.second;
 
-                        // Update Entropy Info
+                        // Compute the taken probability and corresponding linear branch entropy
                         double taken_probability    = double(ctr.n_taken) / double(ctr.n_taken + ctr.n_not_taken);
                         double linear_entropy       = 2 * std::min( taken_probability, (1 - taken_probability) );
 
-                        // Calculating "Tour Entropy" from Local Histroy per Address
+                        // Accumulate execution-weighted entropy for this branch address
                         tour_entropy_per_addr_local_aliasing       += double(ctr.n_taken + ctr.n_not_taken) * linear_entropy;
                         total_instructions_per_addr_local_aliasing += (ctr.n_taken + ctr.n_not_taken);
                     }
 
-                    // Recording Global Tour Entropy in Temporary HashMap 
+                    // Store the local-history entropy for this branch address
                     tour_entropy_per_addr_local_aliasing = (tour_entropy_per_addr_local_aliasing / total_instructions_per_addr_local_aliasing);
                     tour_temporary_local_aliasing[addr] = tour_entropy_per_addr_local_aliasing;
                 }
 
-                // Compare Global History and Local History's Tour Entropy
+                // Select the lower entropy between global- and local-history
                 record_tour_entropy( tour_temporary_global_aliasing, tour_temporary_local_aliasing, tour_temporary_oft_aliasing);
                 average_tour_entropy_aliasing( tour_temporary_oft_aliasing, address_length, n_bit);
             }
         }
     }
 
+    // Print the tournament entropy for each address and history length
     for (auto &e : tour_entropy_list_aliasing) 
     {
         dr_printf("\n\n****************** Tournament Branch Entropy (Address Length = %d!!!) ******************\n\n", e.first);
@@ -489,7 +492,7 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
 
     map_lock = dr_mutex_create();
     
-    // Instrumentation for Conditional Branch Instructions Every Basic Block
+    // Register the basic-block instrumentation callback for conditional branches
     if (!drmgr_register_bb_instrumentation_event(NULL, event_app_instruction, NULL))
         DR_ASSERT_MSG(false, "fail to register event_app_instruction!");
     dr_register_exit_event(dr_exit);

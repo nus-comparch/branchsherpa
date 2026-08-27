@@ -41,45 +41,46 @@
 #include <unordered_map>
 #include <algorithm>
 
+// Number of address bits used for indexing the "Outcome Frequency Table (OFT)"
 #define ADDRESS_LENGTH 48
+// Number of history bits used for indexing the OFT
 #define HISTORY_LENGTH 20
 
-// Declare Lock for Preventing Contention in Global "Outcome Frequency Table (OFT)"
+// Mutex protecting accesses to the global OFT
 static void *map_lock;
 
-// Declare counters (i.e., "taken", "not taken", and "transitions") for each conditional branch
+// Counts taken and not-taken outcomes for a branch under a given history
 typedef struct _counter_per_branch_t {
     uint64_t n_taken;
     uint64_t n_not_taken;
 } counter_per_branch_t;
 
-// Declare variables to compute taken rate and transition rate
+// Stores the taken probability and linear branch entropy for a branch-history pair
 typedef struct _entropy_info_t {
     double taken_probability;
     double linear_entropy;
 } entropy_info_t;
 
-
-// Declare variables and a mask to record a global pattern 
+// Global branch history and mask used to retain the most recent branch outcomes
 #define GLOBAL_PATTERN uint32_t
 #define HISTORY_MASK ( ( 1u << HISTORY_LENGTH ) - 1 )
 GLOBAL_PATTERN global_pattern = 0;
 
-
-// Declare an "Outcome Frequency Table (OFT)" using unodered map (hash table) in C++
+// OFT indexed by branch address and global history
 #define GLOBAL_OFT_DATA_STRUCTURE std::unordered_map<app_pc, std::unordered_map<GLOBAL_PATTERN, counter_per_branch_t>> 
 GLOBAL_OFT_DATA_STRUCTURE global_oft;
 
-// Declare a data structure to compute taken rate and linear branch entropy
+// Temporarily stores entropy information for each branch-history pair
 #define GLOBAL_TEMPORARY_ENTROPY std::unordered_map<app_pc, std::unordered_map<GLOBAL_PATTERN, entropy_info_t>>
 
-// Declare a data structure to store branch entropy values for different address and history lengths
+// Stores branch entropy values for each address and history length.
 #define GLOBAL_ALIASING_ENTROPY_LIST std::unordered_map<int, std::unordered_map<int, double>>
 GLOBAL_ALIASING_ENTROPY_LIST global_aliasing_entropy_list;
 
 
-// Declare variables for global entropy value
+// Total number of conditional branch executions used to normalize entropy
 uint64_t n_cbr_instructions = 0;
+// Accumulates the execution-weighted branch entropy
 double branch_entropy = 0;
 
 
@@ -88,10 +89,13 @@ cbr_count(void *drcontext, app_pc src, app_pc targ, int taken)
 {
     dr_mutex_lock(map_lock);
 
-    // Temporarily store global branch pattern
+    // Record the history preceding the current branch
     GLOBAL_PATTERN history = global_pattern;
 
-    // Update the number of taken in "global OFT" and global branch pattern
+    /*
+     *  Record the branch outcome under the current global history,
+     *  then update the history with the observed outcome
+     */
     auto &taken_update = global_oft[src];
     if (taken)
     {
@@ -110,7 +114,7 @@ static dr_emit_flags_t
 event_app_instruction(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
                       bool for_trace, bool translating, void *user_data)
 {
-    // Instruemnt on conditional branch instructions
+    // Instrument conditional branch instructions
     if(!instr_is_cbr(instr))
         return DR_EMIT_DEFAULT;
     dr_insert_cbr_instrumentation(drcontext, bb, instr, (void*)cbr_count);
@@ -121,34 +125,34 @@ event_app_instruction(void *drcontext, void *tag, instrlist_t *bb, instr_t *inst
 void
 dr_exit(void)
 { 
-    // Calculating branch entropy by applying optimizations in Linear Branch Entropy paper
+    /*
+     * Compute branch entropy by applying the address- and history-merging
+     * Optimizations described in the Linear Branch Entropy paper
+     */
+
     
     /*
-     * Outer loop: merging address bits (first optimization)
-     * Inner loop: mering history bits (second optimization)
-     * Please refere "Linear Branch Entropy" paper for more information
+     * Outer loop progressively merges address bits
+     * Inner loop progressively merges history bits
      */
 
     // ==== outer loop ====
     for(int address_length = ADDRESS_LENGTH; address_length >= 0; --address_length)
     {
         uint64_t address_merging_mask = ( (uint64_t) 1 << address_length) - 1;
-
-        /*
-         * Declare a variable to temporarily record data by merging address bits
-         * To efficiently use memory, the variable is declared inside block
-        */ 
+ 
         {
+            // Temporarily stores the OFT after address-bit merging
             GLOBAL_OFT_DATA_STRUCTURE aliasing_pc_temp;
 
             for(auto &aliasing_entry : global_oft)
             {
-                // Updating Address Length and Recording It to Newly Created OFT
+                // Merge the branch address to the selected address length
                 app_pc pc = aliasing_entry.first;
                 uintptr_t new_address = ((uintptr_t) pc) & address_merging_mask;
                 auto &aliasing_map = aliasing_pc_temp[app_pc(new_address)];
             
-                // Updating Branch Outcome to Newly Created OFT
+                // Merge the outcome counts of branches mapped to the same aliased address
                 auto &old_counter  = aliasing_entry.second;
 
                 for (auto &temp : old_counter)
@@ -164,14 +168,11 @@ dr_exit(void)
             global_oft.swap(aliasing_pc_temp);
         }
 
-        /*
-         * After applying address merging, copy the oft to the new data structure for history bit merging
-         * For memory efficiency, declare a variable inside block
-        */ 
         {
+            // Preserve the address-merged OFT before applying history-bit merging 
             GLOBAL_OFT_DATA_STRUCTURE history_aliasing_oft;
 
-            // Copying the data structure after applying address merging
+            // Copy the address-merged OFT as the starting point for history merging
             history_aliasing_oft.reserve(global_oft.size());
             for (auto &ent : global_oft)
             {
@@ -181,18 +182,15 @@ dr_exit(void)
             // ==== Inner loop ====
             for (int n_bit = HISTORY_LENGTH; n_bit >= 0; --n_bit)
             {
-                // Merging Two History Bits for Smaller Number of History Bits
+                // Merge history patterns to reduce the effective history length to n_bit
                 uint32_t bit_merging_mask = (1u << n_bit) - 1;
 
                 // Initializing variables related to branch entropy calculation
                 branch_entropy = 0;
                 n_cbr_instructions = 0;
     
-                /*
-                 * Declare a variable to temporarily record data by merging history bits
-                 * To efficiently use memory, the variable is declared inside block
-                */
                 {
+                    // Temporarily stores the OFT after history-bit merging
                     GLOBAL_OFT_DATA_STRUCTURE aliasing_hist_temp;
 
                     for(auto &temp_oft : history_aliasing_oft)
@@ -216,13 +214,13 @@ dr_exit(void)
                     history_aliasing_oft.swap(aliasing_hist_temp);
                 }
             
-                // Loop for calculating branch entropies
+                // Compute branch entropy for each branch-history pair
                 for (auto &t : history_aliasing_oft) 
                 {
                     app_pc addr = t.first;
 
-                    // Declare a variable to record taken rate and linear branch entropy
-                    GLOBAL_TEMPORARY_ENTROPY global_entropy_oft; // global_aliasing_entropy_oft
+                    // Temporarily stores entropy information for each branch-history pair
+                    GLOBAL_TEMPORARY_ENTROPY global_entropy_oft; 
                     auto &taken_update = global_entropy_oft[addr];
 
                     for (auto &a : t.second) 
@@ -230,6 +228,7 @@ dr_exit(void)
                         GLOBAL_PATTERN hist = a.first;
                         auto &ctr = a.second;
 
+                        // Total number of executions for the branch-history pair
                         uint64_t total_count = (uint64_t)ctr.n_taken + (uint64_t)ctr.n_not_taken;
                         if (total_count == 0) 
                         {
@@ -240,8 +239,9 @@ dr_exit(void)
                         }
                         else
                         {
-                            //update entropy info 
+                            // Compute the taken probability
                             taken_update[hist].taken_probability = double(ctr.n_taken) / double(ctr.n_taken + ctr.n_not_taken);
+                            // Compute linear branch entropy from the taken probability
                             taken_update[hist].linear_entropy = 2 * std::min(taken_update[hist].taken_probability, (1 - taken_update[hist].taken_probability));
                         }
 
@@ -252,26 +252,28 @@ dr_exit(void)
                             continue;
                         }
 
-                        // Calculating Final "Branch Entropy"
+                        // Weight each branch-history entropy by its execution frequency
                         branch_entropy += (ctr.n_taken + ctr.n_not_taken) * taken_update[hist].linear_entropy;
 
+                        // Accumulate the total number of conditional branch executions
                         n_cbr_instructions += (ctr.n_taken + ctr.n_not_taken);
                     }
 
                 }
-                // dr_printf("Total Instruction # at = %u\n\n", n_cbr_instructions);
+                // Normalize the accumulated entropy by the total number of branch executions
                 branch_entropy = (branch_entropy / n_cbr_instructions);
 
-                // Updating Entropy Value for Specific Address and History Length
+                // Store the entropy for the current address and history lengths
                 auto &update_aliasing = global_aliasing_entropy_list[address_length];
                 update_aliasing[n_bit] = branch_entropy;
             }
         }
     }
 
+    // Report the entropy values for all address and history lengths
     for (auto &e : global_aliasing_entropy_list) 
     {
-        dr_printf("\n\n****************** Global Branch Entropy Value (Address Length = %d!!!) ******************\n\n", e.first);
+        dr_printf("\n\n****************** Global Branch Entropy Value (Address Length = %d) ******************\n\n", e.first);
 
         auto &histories = e.second;
         
@@ -296,7 +298,7 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
 
     map_lock = dr_mutex_create();
     
-    // Instrumentation for Conditional Branch Instructions Every Basic Block
+    // Register the basic-block instrumentation callback for conditional branches
     if (!drmgr_register_bb_instrumentation_event(NULL, event_app_instruction, NULL))
         DR_ASSERT_MSG(false, "fail to register event_app_instruction!");
     dr_register_exit_event(dr_exit);

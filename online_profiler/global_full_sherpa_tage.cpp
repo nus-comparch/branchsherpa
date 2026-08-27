@@ -41,24 +41,27 @@
 #include <unordered_map>
 #include <algorithm>
 
+// Number of address bits used for indexing the "Outcome Frequency Table (OFT)"
 #define ADDRESS_LENGTH  7
+// Number of history bits used for indexing the OFT
 #define HISTORY_LENGTH 48
 
-// Declare Lock for Preventing Contention in Global "Outcome Frequency Table (OFT)"
+// Mutex protecting accesses to the global OFT
 static void *map_lock;
 
-// Declare counters (i.e., "taken", "not taken", and "transitions") for each conditional branch
+// Counts taken and not-taken outcomes for a branch under a given history
 typedef struct _counter_per_branch_t {
     uint64_t n_taken;
     uint64_t n_not_taken;
 } counter_per_branch_t;
 
-// Declare variables to compute taken rate and transition rate
+// Stores the taken probability and linear branch entropy for a branch-history pair
 typedef struct _entropy_info_t {
     double taken_probability;
     double linear_entropy;
 } entropy_info_t;
 
+// Stores the previous outcome, transition count, and execution count
 typedef struct _transition_info_t {
     int         p_outcome       = -1;
     uint64_t    n_transition    = 0;
@@ -66,20 +69,22 @@ typedef struct _transition_info_t {
 } transition_info_t;
 
 
-// Declare Recording Global Pattern
+// Global branch history and mask used to retain the most recent branch outcomes
 #define GLOBAL_PATTERN uint64_t
 #define HISTORY_MASK ( ( (uint64_t)1  <<  HISTORY_LENGTH ) - 1 )
 GLOBAL_PATTERN global_pattern = 0;
 
-// Declare "Outcome Frequency Table (OFT)" using Unodered Map (Hash Table) in C++
+// OFT indexed by branch address and global history
 #define GLOBAL_OFT_DATA_STRUCTURE std::unordered_map<app_pc, std::unordered_map<GLOBAL_PATTERN, counter_per_branch_t>> 
 GLOBAL_OFT_DATA_STRUCTURE global_oft;
 
+// Store transition information for each branch address and global history
 #define GLOBAL_TRANSITION_DATA_STRUCTURE std::unordered_map<app_pc, std::unordered_map<GLOBAL_PATTERN, transition_info_t>>
 GLOBAL_TRANSITION_DATA_STRUCTURE global_transition_oft;
 
-// Declare Variables for Entropy Value from Global Histroy
+// Total number of conditional branch executions used to normalize entropy
 uint64_t n_cbr_instructions = 0;
+// Accumulates the execution-weighted branch entropy
 double branch_entropy = 0;
 
 
@@ -88,9 +93,10 @@ cbr_count(void *drcontext, app_pc src, app_pc targ, int taken)
 {
     dr_mutex_lock(map_lock);
 
-    // Temporarily store global branch pattern
+    // Record the history preceding the current branch
     GLOBAL_PATTERN history = global_pattern;
 
+    // Map the branch address to the configured address length
     uint64_t oft_address_mask = ( (uint64_t) 1 << ADDRESS_LENGTH ) - 1;
     uintptr_t masked_address = ((uintptr_t) src) & oft_address_mask;
     app_pc new_src = app_pc(masked_address);
@@ -100,9 +106,13 @@ cbr_count(void *drcontext, app_pc src, app_pc targ, int taken)
 
     auto &global_transition_counter = transition_update[history];
     
+    /*
+     *  Record the transition statistics and branch outcome count,
+     *  then update the global history with the observed outcome
+     */
     if (taken)
     {
-        // Update transition counter for taken case
+        // Update transition statistics for the taken outcome
         if(global_transition_counter.n_execution == 0)
         {
             global_transition_counter.n_execution++;
@@ -119,13 +129,13 @@ cbr_count(void *drcontext, app_pc src, app_pc targ, int taken)
             }
         }
 
-        // Update the number of taken in "global OFT" and global branch pattern
+        // Update the taken count in the OFT and advance the global history
         taken_update[history].n_taken++;
         global_pattern = ( ( history << 1 ) | 1 ) & HISTORY_MASK;
     }
     else
     {
-        // Update transition counter for not-taken case
+        // Update transition statistics for not-taken outcome
         if(global_transition_counter.n_execution == 0)
         {
             global_transition_counter.n_execution++;
@@ -141,7 +151,7 @@ cbr_count(void *drcontext, app_pc src, app_pc targ, int taken)
             }
         }
 
-        // Update the number of not-taken in "global OFT" and global branch pattern
+        // Update the not-taken count in the OFT and advance the global history
         taken_update[history].n_not_taken++;
         global_pattern = ( ( history << 1 ) | 0 ) & HISTORY_MASK;
     }
@@ -152,7 +162,7 @@ static dr_emit_flags_t
 event_app_instruction(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
                       bool for_trace, bool translating, void *user_data)
 {
-    // Instruemnt on conditional branch instructions
+    // Instrument conditional branch instructions
     if(!instr_is_cbr(instr))
         return DR_EMIT_DEFAULT;
     dr_insert_cbr_instrumentation(drcontext, bb, instr, (void*)cbr_count);
@@ -165,37 +175,38 @@ dr_exit(void)
 {
     dr_printf("======================== Global Branch Entropy Value for Address Length = 7 and History Length = 48 =======================\n\n");
 
-    // Calculating taken rate, transition rate, and branch entropy of a specific address and history length of each conditional branch
+    // Compute the combined branch entropy for each branch-history pair
     for (auto &p : global_oft) 
     {
         app_pc addr = p.first;
 
-        //update entropy info 
         auto &transition_comp   = global_transition_oft[addr];
-        // double temp_transition  = 0;
-        // double temp_value       = 0;
 
         for (auto &a : p.second) 
         {
             GLOBAL_PATTERN hist = a.first;
             auto &ctr = a.second;
 
+            // Compute the taken rate based linear branch entropy
             double temp_taken           = double(ctr.n_taken) / double(ctr.n_taken + ctr.n_not_taken); 
             double temp_linear_entropy  = 2 * std::min( temp_taken, ( 1 - temp_taken ) );
 
+            // Compute the transition rate based linear entropy
             auto &temp_transition_counter = transition_comp[hist];
             double temp_transition = double(temp_transition_counter.n_transition) / double(temp_transition_counter.n_execution);
             temp_transition = 2 * std::min(temp_transition, ( 1 - temp_transition ) );
 
+            // Combine taken rate and transition rate using the minimum value
             double temp_value = std::min(temp_linear_entropy, temp_transition);
 
-            //Calculating final branch entropy
+            // Accumulate execution-weighted combined branch entropy
             branch_entropy += double(ctr.n_taken + ctr.n_not_taken) * temp_value;
+            // Accumulate the total number of conditional branch executions
             n_cbr_instructions += (ctr.n_taken + ctr.n_not_taken);
         }
     }
 
-    // Calculating Final "Branch Entropy"
+    // Normalize by the total number of conditional branch executions
     branch_entropy = (branch_entropy / n_cbr_instructions);
     dr_printf("Branch Entropy = %.6lf\n", branch_entropy);
 
@@ -213,7 +224,7 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
 
     map_lock = dr_mutex_create();
     
-    // Instrumentation for Conditional Branch Instructions Every Basic Block
+    // Register the basic-block instrumentation callback for conditional branches
     if (!drmgr_register_bb_instrumentation_event(NULL, event_app_instruction, NULL))
         DR_ASSERT_MSG(false, "fail to register event_app_instruction!");
     dr_register_exit_event(dr_exit);

@@ -42,9 +42,9 @@
 #include <algorithm>
 
 // Number of address bits used for indexing the "Outcome Frequency Table (OFT)"
-#define ADDRESS_LENGTH 48
+#define ADDRESS_LENGTH 7
 // Number of history bits used for indexing the OFT
-#define HISTORY_LENGTH 20
+#define HISTORY_LENGTH 25
 
 // Mutex protecting accesses to the global OFT
 static void *map_lock;
