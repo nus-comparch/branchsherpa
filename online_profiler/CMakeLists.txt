@@ -70,13 +70,13 @@ add_library(tour_lbe_opt SHARED tour_lbe_opt.cpp)
 configure_DynamoRIO_client(tour_lbe_opt)
 use_DynamoRIO_extension(tour_lbe_opt drmgr)
 
+## ============= Building "tour entropy derivation tool (for modeling multi-component predictors)" =============
+add_library(tour_lbe_components SHARED tour_lbe_components.cpp)
+configure_DynamoRIO_client(tour_lbe_components)
+use_DynamoRIO_extension(tour_lbe_components drmgr)
+
 
 ## **************************** BranchSherpa ****************************
-## ============= Building "global entropy derivation tool (w/ optimizations)" =============
-add_library(global_sherpa SHARED global_sherpa.cpp)
-configure_DynamoRIO_client(global_sherpa)
-use_DynamoRIO_extension(global_sherpa drmgr)
-
 ## ============= Building "global entropy derivation tool (for TAGE)" =============
 add_library(global_longer_sherpa_tage SHARED global_longer_sherpa_tage.cpp)
 configure_DynamoRIO_client(global_longer_sherpa_tage)
